@@ -72,8 +72,6 @@ services:
       - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
-    ports:
-      - "9092:9092"
     volumes:
       - kafka_data:/bitnami/kafka
     healthcheck:
@@ -111,8 +109,6 @@ services:
       - ./debezium/register-connector.sh:/scripts/register-connector.sh:ro
       - ./debezium/entrypoint.sh:/scripts/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/scripts/entrypoint.sh"]
-    ports:
-      - "8083:8083"
     depends_on:
       kafka:
         condition: service_healthy
@@ -204,7 +200,7 @@ services:
     volumes:
       - ./output:/output
     ports:
-      - "8084:8083"
+      - "8083:8083"
     depends_on:
       kafka:
         condition: service_healthy
