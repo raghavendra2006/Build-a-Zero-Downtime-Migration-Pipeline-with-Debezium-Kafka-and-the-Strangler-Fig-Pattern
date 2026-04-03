@@ -20,11 +20,9 @@ import logging
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 logging.basicConfig(

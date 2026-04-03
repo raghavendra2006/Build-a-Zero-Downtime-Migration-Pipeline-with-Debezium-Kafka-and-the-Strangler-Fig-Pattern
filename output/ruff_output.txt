@@ -1,0 +1,48 @@
+﻿F401 [*] `decimal.Decimal` imported but unused
+  --> gateway\main.py:23:21
+   |
+21 | from contextlib import asynccontextmanager
+22 | from datetime import datetime, timezone
+23 | from decimal import Decimal, InvalidOperation
+   |                     ^^^^^^^
+24 |
+25 | import httpx
+   |
+help: Remove unused import
+
+F401 [*] `decimal.InvalidOperation` imported but unused
+  --> gateway\main.py:23:30
+   |
+21 | from contextlib import asynccontextmanager
+22 | from datetime import datetime, timezone
+23 | from decimal import Decimal, InvalidOperation
+   |                              ^^^^^^^^^^^^^^^^
+24 |
+25 | import httpx
+   |
+help: Remove unused import
+
+F401 [*] `fastapi.HTTPException` imported but unused
+  --> gateway\main.py:26:30
+   |
+25 | import httpx
+26 | from fastapi import FastAPI, HTTPException
+   |                              ^^^^^^^^^^^^^
+27 | from fastapi.responses import JSONResponse
+28 | from pydantic import BaseModel, Field
+   |
+help: Remove unused import: `fastapi.HTTPException`
+
+F401 [*] `fastapi.responses.JSONResponse` imported but unused
+  --> gateway\main.py:27:31
+   |
+25 | import httpx
+26 | from fastapi import FastAPI, HTTPException
+27 | from fastapi.responses import JSONResponse
+   |                               ^^^^^^^^^^^^
+28 | from pydantic import BaseModel, Field
+   |
+help: Remove unused import: `fastapi.responses.JSONResponse`
+
+Found 4 errors.
+[*] 4 fixable with the `--fix` option.
