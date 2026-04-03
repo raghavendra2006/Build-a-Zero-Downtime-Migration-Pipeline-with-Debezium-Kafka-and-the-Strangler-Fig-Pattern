@@ -1,19 +1,32 @@
 """
 Legacy Service — Handles order creation in the legacy PostgreSQL database.
-Exposes POST /legacy/orders for inserting new orders.
+
+Exposes:
+  POST /legacy/orders  — Insert a new order
+  GET  /health         — Health check with DB connectivity verification
+
+Design:
+  - asyncpg connection pool with retry logic
+  - Proper Decimal handling for NUMERIC columns
+  - Structured logging
+  - Graceful shutdown
 """
 
 import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
 
 import asyncpg
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
+)
 logger = logging.getLogger("legacy_service")
 
 # ---------------------------------------------------------------------------
@@ -24,7 +37,6 @@ DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 DB_NAME = os.getenv("DB_NAME", "postgres")
-
 
 # ---------------------------------------------------------------------------
 # Database pool
@@ -45,11 +57,12 @@ async def init_pool() -> asyncpg.Pool:
                 min_size=2,
                 max_size=10,
             )
-            logger.info("Connected to legacy_db")
+            logger.info("Connected to legacy_db at %s:%d", DB_HOST, DB_PORT)
             return p
         except Exception as exc:
-            logger.warning("DB connection attempt %d failed: %s", attempt + 1, exc)
-            await asyncio.sleep(2)
+            wait = min(2 + attempt * 0.5, 10)
+            logger.warning("DB connection attempt %d failed: %s (retry in %.1fs)", attempt + 1, exc, wait)
+            await asyncio.sleep(wait)
     raise RuntimeError("Could not connect to legacy_db after 30 attempts")
 
 
@@ -60,18 +73,24 @@ async def lifespan(app: FastAPI):
     yield
     if pool:
         await pool.close()
+    logger.info("Legacy service shutdown complete")
 
 
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Legacy Service", lifespan=lifespan)
+app = FastAPI(
+    title="Legacy Service",
+    description="Order creation endpoint for the legacy PostgreSQL database",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 class OrderRequest(BaseModel):
-    customer_id: int
-    amount: float
-    status: str = "PENDING"
+    customer_id: int = Field(..., gt=0, description="Customer identifier")
+    amount: float = Field(..., gt=0, description="Order amount (must be positive)")
+    status: str = Field(default="PENDING", description="Order status")
 
 
 @app.get("/health")
@@ -89,6 +108,12 @@ async def health():
 async def create_order(order: OrderRequest):
     """Insert a new order into the legacy database."""
     try:
+        # Convert to Decimal for precise NUMERIC(10,2) storage
+        amount_decimal = Decimal(str(order.amount)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid amount value")
+
+    try:
         async with pool.acquire() as conn:
             order_id = await conn.fetchval(
                 """
@@ -97,7 +122,7 @@ async def create_order(order: OrderRequest):
                 RETURNING order_id
                 """,
                 order.customer_id,
-                round(float(order.amount), 2),
+                amount_decimal,
                 order.status,
             )
         return JSONResponse(
@@ -105,5 +130,5 @@ async def create_order(order: OrderRequest):
             content={"order_id": order_id, "status": "created"},
         )
     except Exception as exc:
-        logger.error("Failed to create order: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.error("Failed to create order: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")

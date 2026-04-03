@@ -1,6 +1,13 @@
 """
 CDC Consumer Service — Consumes Debezium CDC events from Kafka,
 writes them to /output/cdc_events.jsonl, and exposes a status endpoint.
+
+Design:
+  - Single parse per message (no double JSON.loads)
+  - Buffered async file I/O via aiofiles
+  - Robust snapshot detection using both source.snapshot and op fields
+  - Thread-safe counters via asyncio.Lock
+  - Graceful shutdown with proper consumer cleanup
 """
 
 import os
@@ -9,11 +16,15 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+import aiofiles
 import asyncpg
 from aiokafka import AIOKafkaConsumer
 from fastapi import FastAPI, HTTPException
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
+)
 logger = logging.getLogger("cdc_consumer")
 
 # ---------------------------------------------------------------------------
@@ -30,78 +41,93 @@ LEGACY_DB_USER = os.getenv("LEGACY_DB_USER", "postgres")
 LEGACY_DB_PASSWORD = os.getenv("LEGACY_DB_PASSWORD", "postgres")
 LEGACY_DB_NAME = os.getenv("LEGACY_DB_NAME", "postgres")
 
+
 # ---------------------------------------------------------------------------
-# State tracking
+# Thread-safe state
 # ---------------------------------------------------------------------------
-snapshot_complete = False
-snapshot_row_count = 0
-streaming_row_count = 0
-total_cdc_events = 0
+class CDCState:
+    """Thread-safe container for CDC consumer state."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.snapshot_complete: bool = False
+        self.snapshot_row_count: int = 0
+        self.streaming_row_count: int = 0
+        self.total_cdc_events: int = 0
+
+
+cdc_state = CDCState()
 consumer_task: asyncio.Task | None = None
 db_pool: asyncpg.Pool | None = None
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Debezium event parsing — SINGLE PARSE per message
 # ---------------------------------------------------------------------------
-def convert_numeric(obj):
-    """Convert Decimal types to float for JSON serialization."""
-    from decimal import Decimal
-    if isinstance(obj, Decimal):
-        return float(obj)
-    if isinstance(obj, dict):
-        return {k: convert_numeric(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [convert_numeric(i) for i in obj]
-    return obj
+def parse_and_classify(raw_value: bytes) -> tuple[dict | None, str]:
+    """Parse a raw Debezium message in a single pass.
 
-
-def parse_debezium_event(raw_value: bytes) -> dict | None:
-    """Parse a Debezium envelope and extract op, before, after, ts_ms."""
-    try:
-        envelope = json.loads(raw_value.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        logger.warning("Unable to decode Kafka message")
-        return None
-
-    # Debezium wraps in a 'payload' key when using the default envelope
-    payload = envelope.get("payload", envelope)
-    if not isinstance(payload, dict):
-        return None
-
-    op = payload.get("op")
-    if op is None:
-        return None
-
-    return {
-        "op": op,
-        "before": convert_numeric(payload.get("before")),
-        "after": convert_numeric(payload.get("after")),
-        "ts_ms": payload.get("ts_ms", 0),
-    }
-
-
-def is_snapshot_event(raw_value: bytes) -> bool | None:
-    """Check if the event is part of the initial snapshot.
-    
-    Returns True if snapshot, False if streaming, None if unknown.
+    Returns:
+        (event_dict, snapshot_status) where:
+        - event_dict is {op, before, after, ts_ms} or None on parse failure
+        - snapshot_status is "snapshot", "last", "streaming", or "unknown"
     """
     try:
         envelope = json.loads(raw_value.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        logger.warning("Unable to decode Kafka message")
+        return None, "unknown"
 
+    # Handle both wrapped (schema+payload) and schema-less formats
+    if not isinstance(envelope, dict):
+        return None, "unknown"
     payload = envelope.get("payload", envelope)
     if not isinstance(payload, dict):
-        return None
+        return None, "unknown"
 
+    op = payload.get("op")
+    if op is None:
+        return None, "unknown"
+
+    # --- Build output event ---
+    event = {
+        "op": op,
+        "before": _sanitize_values(payload.get("before")),
+        "after": _sanitize_values(payload.get("after")),
+        "ts_ms": payload.get("ts_ms", 0),
+    }
+
+    # --- Classify snapshot status ---
+    snap_status = "streaming"
     source = payload.get("source", {})
-    snapshot_val = source.get("snapshot", "false")
+    if isinstance(source, dict):
+        snapshot_val = source.get("snapshot")
+        if snapshot_val == "last":
+            snap_status = "last"
+        elif snapshot_val in ("true", True):
+            snap_status = "snapshot"
+        elif op == "r":
+            # Fallback: op=r means snapshot read even if source.snapshot missing
+            snap_status = "snapshot"
+    elif op == "r":
+        snap_status = "snapshot"
 
-    # Debezium uses "true", "last", or "false" for the snapshot field
-    if snapshot_val in ("true", "last"):
-        return True
-    return False
+    return event, snap_status
+
+
+def _sanitize_values(obj):
+    """Recursively convert Decimal-like values for safe JSON serialization."""
+    from decimal import Decimal
+
+    if obj is None:
+        return None
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_values(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_values(i) for i in obj]
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -109,8 +135,6 @@ def is_snapshot_event(raw_value: bytes) -> bool | None:
 # ---------------------------------------------------------------------------
 async def consume_cdc_events():
     """Background coroutine that consumes CDC events from Kafka."""
-    global snapshot_complete, snapshot_row_count, streaming_row_count, total_cdc_events
-
     logger.info("Starting Kafka consumer for topic '%s'", KAFKA_TOPIC)
 
     consumer = AIOKafkaConsumer(
@@ -122,76 +146,72 @@ async def consume_cdc_events():
         value_deserializer=lambda v: v,  # raw bytes
     )
 
-    # Retry connecting to Kafka
+    # Retry connecting to Kafka with backoff
     for attempt in range(60):
         try:
             await consumer.start()
-            logger.info("Kafka consumer started")
+            logger.info("Kafka consumer connected to %s", KAFKA_BROKER)
             break
         except Exception as exc:
-            logger.warning("Kafka connect attempt %d: %s", attempt + 1, exc)
-            await asyncio.sleep(3)
+            wait = min(3 + attempt * 0.5, 10)
+            logger.warning("Kafka connect attempt %d: %s (retry in %.1fs)", attempt + 1, exc, wait)
+            await asyncio.sleep(wait)
     else:
-        logger.error("Could not connect to Kafka after 60 attempts")
+        logger.error("FATAL: Could not connect to Kafka after 60 attempts")
         return
 
     # Ensure output directory exists
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 
+    # Use async file handle for buffered I/O
     try:
-        async for msg in consumer:
-            raw = msg.value
-            if raw is None:
-                continue
+        async with aiofiles.open(OUTPUT_FILE, mode="a", encoding="utf-8") as outfile:
+            async for msg in consumer:
+                raw = msg.value
+                if raw is None:
+                    continue
 
-            event = parse_debezium_event(raw)
-            if event is None:
-                continue
+                # SINGLE parse per message
+                event, snap_status = parse_and_classify(raw)
+                if event is None:
+                    continue
 
-            # Determine if this is a snapshot or streaming event
-            is_snap = is_snapshot_event(raw)
+                # Async write to JSONL
+                await outfile.write(json.dumps(event, default=str) + "\n")
+                await outfile.flush()
 
-            # Write to JSONL file
-            with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event, default=str) + "\n")
+                # Update state under lock
+                async with cdc_state.lock:
+                    cdc_state.total_cdc_events += 1
 
-            total_cdc_events += 1
+                    if snap_status in ("snapshot", "last") and not cdc_state.snapshot_complete:
+                        cdc_state.snapshot_row_count += 1
+                        if snap_status == "last":
+                            cdc_state.snapshot_complete = True
+                            logger.info(
+                                "Snapshot complete (last marker) — %d rows",
+                                cdc_state.snapshot_row_count,
+                            )
+                    elif snap_status == "streaming":
+                        if not cdc_state.snapshot_complete:
+                            cdc_state.snapshot_complete = True
+                            logger.info(
+                                "Snapshot complete (first streaming event) — %d rows",
+                                cdc_state.snapshot_row_count,
+                            )
+                        cdc_state.streaming_row_count += 1
 
-            if is_snap and not snapshot_complete:
-                snapshot_row_count += 1
-                # Check if this is the last snapshot record
-                try:
-                    envelope = json.loads(raw.decode("utf-8"))
-                    payload = envelope.get("payload", envelope)
-                    source = payload.get("source", {})
-                    if source.get("snapshot") == "last":
-                        snapshot_complete = True
+                    if cdc_state.total_cdc_events % 1000 == 0:
                         logger.info(
-                            "Snapshot complete — %d rows captured", snapshot_row_count
+                            "Processed %d events (snap=%d, stream=%d)",
+                            cdc_state.total_cdc_events,
+                            cdc_state.snapshot_row_count,
+                            cdc_state.streaming_row_count,
                         )
-                except Exception:
-                    pass
-            elif not is_snap:
-                if not snapshot_complete:
-                    # First non-snapshot event means snapshot is done
-                    snapshot_complete = True
-                    logger.info(
-                        "Snapshot complete (detected via first streaming event) — %d rows",
-                        snapshot_row_count,
-                    )
-                streaming_row_count += 1
-
-            if total_cdc_events % 1000 == 0:
-                logger.info(
-                    "Processed %d CDC events (snap=%d, stream=%d)",
-                    total_cdc_events,
-                    snapshot_row_count,
-                    streaming_row_count,
-                )
     except asyncio.CancelledError:
         logger.info("Kafka consumer task cancelled")
     except Exception as exc:
-        logger.error("Kafka consumer error: %s", exc)
+        logger.error("Kafka consumer error: %s", exc, exc_info=True)
     finally:
         await consumer.stop()
         logger.info("Kafka consumer stopped")
@@ -218,7 +238,7 @@ async def init_db_pool() -> asyncpg.Pool:
         except Exception as exc:
             logger.warning("DB pool attempt %d: %s", attempt + 1, exc)
             await asyncio.sleep(2)
-    raise RuntimeError("Could not connect to legacy_db for row counts")
+    raise RuntimeError("Could not connect to legacy_db after 30 attempts")
 
 
 # ---------------------------------------------------------------------------
@@ -238,15 +258,22 @@ async def lifespan(app: FastAPI):
             pass
     if db_pool:
         await db_pool.close()
+    logger.info("CDC Consumer shutdown complete")
 
 
-app = FastAPI(title="CDC Consumer Service", lifespan=lifespan)
+app = FastAPI(
+    title="CDC Consumer Service",
+    description="Debezium CDC event consumer with status reporting",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "healthy", "consumer_running": consumer_task is not None and not consumer_task.done()}
+    running = consumer_task is not None and not consumer_task.done()
+    return {"status": "healthy", "consumer_running": running}
 
 
 @app.get("/cdc/status")
@@ -259,11 +286,12 @@ async def cdc_status():
         logger.error("Failed to query db_row_count: %s", exc)
         raise HTTPException(status_code=500, detail=f"DB query failed: {exc}")
 
-    return {
-        "snapshot_complete": snapshot_complete,
-        "snapshot_row_count": snapshot_row_count,
-        "streaming_row_count": streaming_row_count,
-        "total_cdc_events": total_cdc_events,
-        "db_row_count": db_count,
-        "discrepancy": db_count - total_cdc_events,
-    }
+    async with cdc_state.lock:
+        return {
+            "snapshot_complete": cdc_state.snapshot_complete,
+            "snapshot_row_count": cdc_state.snapshot_row_count,
+            "streaming_row_count": cdc_state.streaming_row_count,
+            "total_cdc_events": cdc_state.total_cdc_events,
+            "db_row_count": db_count,
+            "discrepancy": db_count - cdc_state.total_cdc_events,
+        }

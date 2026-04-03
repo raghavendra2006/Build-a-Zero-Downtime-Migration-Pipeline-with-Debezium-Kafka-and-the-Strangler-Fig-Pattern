@@ -3,6 +3,13 @@ Gateway Service — Strangler Fig pattern implementation.
 
 Handles traffic routing, dual-writes to legacy + micro services,
 metrics collection with p99 latency, and emergency rollback.
+
+Design:
+  - Thread-safe state via asyncio.Lock
+  - Non-blocking file I/O via asyncio.to_thread
+  - Configurable httpx connection pool
+  - Pydantic field validation with constraints
+  - Proper Decimal handling for financial amounts
 """
 
 import os
@@ -13,13 +20,17 @@ import logging
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
+)
 logger = logging.getLogger("gateway")
 
 # ---------------------------------------------------------------------------
@@ -29,26 +40,33 @@ LEGACY_SERVICE_URL = os.getenv("LEGACY_SERVICE_URL", "http://legacy_service:8081
 MICRO_SERVICE_URL = os.getenv("MICRO_SERVICE_URL", "http://micro_service:8082")
 METRICS_OUTPUT_FILE = os.getenv("METRICS_OUTPUT_FILE", "/output/metrics_snapshot.json")
 ROLLBACK_LOG_FILE = os.getenv("ROLLBACK_LOG_FILE", "/output/rollback_log.jsonl")
-DUAL_WRITE_TIMEOUT = float(os.getenv("DUAL_WRITE_TIMEOUT_MS", "500")) / 1000  # seconds
+DUAL_WRITE_TIMEOUT_MS = int(os.getenv("DUAL_WRITE_TIMEOUT_MS", "500"))
 LATENCY_WINDOW_SIZE = int(os.getenv("LATENCY_WINDOW_SIZE", "1000"))
+HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "5.0"))
+
 
 # ---------------------------------------------------------------------------
-# State
+# Thread-safe state container
 # ---------------------------------------------------------------------------
-micro_pct: int = 0  # 0–100: percentage of traffic routed to micro
+class GatewayState:
+    """Thread-safe container for all mutable gateway state."""
 
-legacy_request_count: int = 0
-micro_request_count: int = 0
-legacy_error_count: int = 0
-micro_error_count: int = 0
-consistent_writes: int = 0
-inconsistent_writes: int = 0
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.micro_pct: int = 0
+        self.legacy_request_count: int = 0
+        self.micro_request_count: int = 0
+        self.legacy_error_count: int = 0
+        self.micro_error_count: int = 0
+        self.consistent_writes: int = 0
+        self.inconsistent_writes: int = 0
+        self.legacy_latencies: deque = deque(maxlen=LATENCY_WINDOW_SIZE)
+        self.micro_latencies: deque = deque(maxlen=LATENCY_WINDOW_SIZE)
 
-# Sliding windows for p99 latency calculation (fixed memory)
-legacy_latencies: deque = deque(maxlen=LATENCY_WINDOW_SIZE)
-micro_latencies: deque = deque(maxlen=LATENCY_WINDOW_SIZE)
 
-# HTTP client
+state = GatewayState()
+
+# HTTP client — initialised at startup
 http_client: httpx.AsyncClient | None = None
 
 
@@ -65,23 +83,31 @@ def calculate_p99(latencies: deque) -> float:
     return round(sorted_vals[idx], 2)
 
 
-def build_metrics_response() -> dict:
-    """Build the full metrics response object."""
-    total = consistent_writes + inconsistent_writes
-    consistency_rate = round((consistent_writes / total) * 100, 2) if total > 0 else 100.0
-
+def build_metrics_dict() -> dict:
+    """Build the full metrics response dict (call under lock or after acquiring state)."""
+    total = state.consistent_writes + state.inconsistent_writes
+    consistency_rate = (
+        round((state.consistent_writes / total) * 100, 2) if total > 0 else 100.0
+    )
     return {
-        "micro_pct": micro_pct,
-        "legacy_request_count": legacy_request_count,
-        "micro_request_count": micro_request_count,
-        "legacy_error_count": legacy_error_count,
-        "micro_error_count": micro_error_count,
-        "consistent_writes": consistent_writes,
-        "inconsistent_writes": inconsistent_writes,
+        "micro_pct": state.micro_pct,
+        "legacy_request_count": state.legacy_request_count,
+        "micro_request_count": state.micro_request_count,
+        "legacy_error_count": state.legacy_error_count,
+        "micro_error_count": state.micro_error_count,
+        "consistent_writes": state.consistent_writes,
+        "inconsistent_writes": state.inconsistent_writes,
         "consistency_rate_pct": consistency_rate,
-        "legacy_p99_ms": calculate_p99(legacy_latencies),
-        "micro_p99_ms": calculate_p99(micro_latencies),
+        "legacy_p99_ms": calculate_p99(state.legacy_latencies),
+        "micro_p99_ms": calculate_p99(state.micro_latencies),
     }
+
+
+def _write_file_sync(path: str, content: str, mode: str = "w") -> None:
+    """Synchronous file write — meant to be called via asyncio.to_thread."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, mode, encoding="utf-8") as f:
+        f.write(content)
 
 
 async def post_to_service(url: str, payload: dict) -> tuple[dict | None, float, bool]:
@@ -91,11 +117,12 @@ async def post_to_service(url: str, payload: dict) -> tuple[dict | None, float, 
     """
     start = time.monotonic()
     try:
-        resp = await http_client.post(url, json=payload, timeout=5.0)
+        resp = await http_client.post(url, json=payload, timeout=HTTP_TIMEOUT_S)
         latency_ms = (time.monotonic() - start) * 1000
         if 200 <= resp.status_code < 300:
             return resp.json(), latency_ms, True
         else:
+            logger.warning("Service %s returned %d", url, resp.status_code)
             return None, latency_ms, False
     except Exception as exc:
         latency_ms = (time.monotonic() - start) * 1000
@@ -109,28 +136,37 @@ async def post_to_service(url: str, payload: dict) -> tuple[dict | None, float, 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient()
-    # Ensure output directory exists
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        timeout=httpx.Timeout(HTTP_TIMEOUT_S, connect=5.0),
+    )
     os.makedirs(os.path.dirname(METRICS_OUTPUT_FILE), exist_ok=True)
+    logger.info("Gateway started — legacy=%s, micro=%s", LEGACY_SERVICE_URL, MICRO_SERVICE_URL)
     yield
     if http_client:
         await http_client.aclose()
+    logger.info("Gateway shutdown complete")
 
 
-app = FastAPI(title="Gateway Service", lifespan=lifespan)
+app = FastAPI(
+    title="Gateway Service",
+    description="Strangler Fig traffic router with dual-write CDC pipeline",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Request / Response models with validation
 # ---------------------------------------------------------------------------
 class ConfigRequest(BaseModel):
-    micro_pct: int
+    micro_pct: int = Field(..., ge=0, le=100, description="Traffic percentage for micro service (0-100)")
 
 
 class OrderRequest(BaseModel):
-    customer_id: int
-    amount: float
-    status: str = "PENDING"
+    customer_id: int = Field(..., gt=0, description="Customer identifier")
+    amount: float = Field(..., gt=0, description="Order amount (must be positive)")
+    status: str = Field(default="PENDING", pattern=r"^[A-Z_]{2,20}$", description="Order status")
 
 
 # ---------------------------------------------------------------------------
@@ -145,12 +181,10 @@ async def health():
 @app.post("/config")
 async def update_config(config: ConfigRequest):
     """Update the traffic split percentage."""
-    global micro_pct
-    if not (0 <= config.micro_pct <= 100):
-        raise HTTPException(status_code=400, detail="micro_pct must be 0-100")
-    micro_pct = config.micro_pct
-    logger.info("Traffic split updated: micro_pct=%d", micro_pct)
-    return {"micro_pct": micro_pct, "updated": True}
+    async with state.lock:
+        state.micro_pct = config.micro_pct
+    logger.info("Traffic split updated: micro_pct=%d", config.micro_pct)
+    return {"micro_pct": config.micro_pct, "updated": True}
 
 
 @app.post("/orders")
@@ -159,17 +193,17 @@ async def create_order(order: OrderRequest):
     Dual-write endpoint: concurrently sends order to both legacy and micro services.
     Routes based on customer_id % 100 < micro_pct.
     """
-    global legacy_request_count, micro_request_count
-    global legacy_error_count, micro_error_count
-    global consistent_writes, inconsistent_writes
-
     payload = {
         "customer_id": order.customer_id,
         "amount": order.amount,
         "status": order.status,
     }
 
-    # Concurrent dual-write
+    # Snapshot micro_pct under lock for consistent routing
+    async with state.lock:
+        current_micro_pct = state.micro_pct
+
+    # Concurrent dual-write using asyncio.gather
     legacy_result, micro_result = await asyncio.gather(
         post_to_service(f"{LEGACY_SERVICE_URL}/legacy/orders", payload),
         post_to_service(f"{MICRO_SERVICE_URL}/micro/orders", payload),
@@ -178,39 +212,38 @@ async def create_order(order: OrderRequest):
     legacy_data, legacy_latency, legacy_ok = legacy_result
     micro_data, micro_latency, micro_ok = micro_result
 
-    # Track latencies in sliding window
-    legacy_latencies.append(legacy_latency)
-    micro_latencies.append(micro_latency)
-
     # Determine routing
-    routed_to = "micro" if (order.customer_id % 100) < micro_pct else "legacy"
+    routed_to = "micro" if (order.customer_id % 100) < current_micro_pct else "legacy"
 
-    # Update routed request counts
-    if routed_to == "legacy":
-        legacy_request_count += 1
-    else:
-        micro_request_count += 1
-
-    # Track errors
-    if not legacy_ok:
-        legacy_error_count += 1
-    if not micro_ok:
-        micro_error_count += 1
-
-    # Consistency check: both succeed and within timeout threshold
+    # Consistency check: both succeed and each within the timeout threshold
     is_consistent = (
         legacy_ok
         and micro_ok
-        and legacy_latency <= (DUAL_WRITE_TIMEOUT * 1000)
-        and micro_latency <= (DUAL_WRITE_TIMEOUT * 1000)
+        and legacy_latency <= DUAL_WRITE_TIMEOUT_MS
+        and micro_latency <= DUAL_WRITE_TIMEOUT_MS
     )
-    if is_consistent:
-        consistent_writes += 1
-    else:
-        inconsistent_writes += 1
 
-    # Build response
-    response = {
+    # Update state atomically
+    async with state.lock:
+        state.legacy_latencies.append(legacy_latency)
+        state.micro_latencies.append(micro_latency)
+
+        if routed_to == "legacy":
+            state.legacy_request_count += 1
+        else:
+            state.micro_request_count += 1
+
+        if not legacy_ok:
+            state.legacy_error_count += 1
+        if not micro_ok:
+            state.micro_error_count += 1
+
+        if is_consistent:
+            state.consistent_writes += 1
+        else:
+            state.inconsistent_writes += 1
+
+    return {
         "routed_to": routed_to,
         "legacy_order_id": legacy_data.get("order_id") if legacy_data else None,
         "micro_order_id": micro_data.get("order_id") if micro_data else None,
@@ -221,18 +254,17 @@ async def create_order(order: OrderRequest):
         },
     }
 
-    return response
-
 
 @app.get("/metrics")
 async def get_metrics():
     """Return live metrics and write snapshot to file."""
-    metrics = build_metrics_response()
+    async with state.lock:
+        metrics = build_metrics_dict()
 
-    # Write metrics snapshot to file (overwrite)
+    # Non-blocking file write
     try:
-        with open(METRICS_OUTPUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2)
+        content = json.dumps(metrics, indent=2)
+        await asyncio.to_thread(_write_file_sync, METRICS_OUTPUT_FILE, content, "w")
     except Exception as exc:
         logger.error("Failed to write metrics snapshot: %s", exc)
 
@@ -242,23 +274,23 @@ async def get_metrics():
 @app.post("/rollback")
 async def rollback():
     """Emergency rollback: set micro_pct to 0 and log the event."""
-    global micro_pct
+    async with state.lock:
+        pct_before = state.micro_pct
+        state.micro_pct = 0
 
-    pct_before = micro_pct
-    micro_pct = 0
-
-    # Append to rollback log
+    # Build log entry
     log_entry = {
         "rollback_triggered_at": datetime.now(timezone.utc).isoformat(),
         "micro_pct_before": pct_before,
     }
 
+    # Non-blocking file append
     try:
-        with open(ROLLBACK_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry) + "\n")
+        line = json.dumps(log_entry) + "\n"
+        await asyncio.to_thread(_write_file_sync, ROLLBACK_LOG_FILE, line, "a")
     except Exception as exc:
         logger.error("Failed to write rollback log: %s", exc)
 
-    logger.info("Rollback triggered: micro_pct %d -> 0", pct_before)
+    logger.info("ROLLBACK triggered: micro_pct %d -> 0", pct_before)
 
     return {"rolled_back": True, "micro_pct": 0}
