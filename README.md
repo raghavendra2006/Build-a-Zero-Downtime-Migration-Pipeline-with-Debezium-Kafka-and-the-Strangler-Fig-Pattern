@@ -258,7 +258,3 @@ All services use `restart: unless-stopped` with graceful shutdown via `stop_grac
 1. Check gateway logs: `docker logs gateway`
 2. Verify downstream services: `curl http://localhost:8081/health` and `curl http://localhost:8082/health`
 3. Check database connectivity: `docker exec legacy_db psql -U postgres -c "SELECT COUNT(*) FROM orders;"`
-
-## License
-
-MIT
