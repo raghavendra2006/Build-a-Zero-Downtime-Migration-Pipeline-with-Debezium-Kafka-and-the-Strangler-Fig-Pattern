@@ -1,0 +1,29 @@
+﻿INFO:     127.0.0.1:54516 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57972 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37082 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43418 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50924 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53464 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40190 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47046 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:41942 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:59014 - "GET /cdc/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50500 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47954 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35338 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40494 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35706 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36156 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53244 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49106 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52874 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45934 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.18.0.1:49436 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.18.0.1:49436 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:39814 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:43354 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60276 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37208 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48222 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34520 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44438 - "GET /health HTTP/1.1" 200 OK
