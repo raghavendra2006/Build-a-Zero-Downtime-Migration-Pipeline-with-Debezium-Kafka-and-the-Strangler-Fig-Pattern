@@ -181,7 +181,3 @@ The CDC consumer parses Debezium's envelope format, detecting snapshot completio
 | Databases | PostgreSQL 14 | Robust, supports logical replication for CDC |
 | Message Broker | Apache Kafka 3.6 (KRaft) | Simplified architecture without ZooKeeper dependency |
 | CDC Engine | Debezium 2.5 | Industry-standard CDC with PostgreSQL WAL integration |
-
-## License
-
-MIT
