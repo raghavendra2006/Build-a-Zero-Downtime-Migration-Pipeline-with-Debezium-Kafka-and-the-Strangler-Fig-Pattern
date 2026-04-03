@@ -1,8 +1,8 @@
-version: "3.9"
-
 # =============================================================================
 # Zero-Downtime Migration Pipeline
 # Strangler Fig Pattern + CDC with Debezium, Kafka, and PostgreSQL
+#
+# Usage: docker compose up --build -d
 # =============================================================================
 
 services:
@@ -12,6 +12,7 @@ services:
   legacy_db:
     image: postgres:14
     container_name: legacy_db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
@@ -36,6 +37,7 @@ services:
   micro_db:
     image: postgres:14
     container_name: micro_db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
@@ -59,6 +61,7 @@ services:
   kafka:
     image: apache/kafka:3.7.0
     container_name: kafka
+    restart: unless-stopped
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -88,6 +91,7 @@ services:
   debezium:
     image: debezium/connect:2.5
     container_name: debezium
+    restart: unless-stopped
     environment:
       BOOTSTRAP_SERVERS: kafka:9092
       GROUP_ID: debezium-connect
@@ -130,6 +134,7 @@ services:
       context: ./legacy_service
       dockerfile: Dockerfile
     container_name: legacy_service
+    restart: unless-stopped
     environment:
       DB_HOST: legacy_db
       DB_PORT: 5432
@@ -147,6 +152,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+    stop_grace_period: 10s
     networks:
       - migration_net
 
@@ -158,6 +164,7 @@ services:
       context: ./micro_service
       dockerfile: Dockerfile
     container_name: micro_service
+    restart: unless-stopped
     environment:
       DB_HOST: micro_db
       DB_PORT: 5432
@@ -175,6 +182,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+    stop_grace_period: 10s
     networks:
       - migration_net
 
@@ -186,6 +194,7 @@ services:
       context: ./cdc_consumer
       dockerfile: Dockerfile
     container_name: cdc_consumer
+    restart: unless-stopped
     environment:
       KAFKA_BROKER: kafka:9092
       KAFKA_TOPIC: legacyserver.public.orders
@@ -213,6 +222,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+    stop_grace_period: 15s
     networks:
       - migration_net
 
@@ -224,6 +234,7 @@ services:
       context: ./gateway
       dockerfile: Dockerfile
     container_name: gateway
+    restart: unless-stopped
     environment:
       LEGACY_SERVICE_URL: http://legacy_service:8081
       MICRO_SERVICE_URL: http://micro_service:8082
@@ -231,6 +242,7 @@ services:
       ROLLBACK_LOG_FILE: /output/rollback_log.jsonl
       DUAL_WRITE_TIMEOUT_MS: 500
       LATENCY_WINDOW_SIZE: 1000
+      HTTP_TIMEOUT_S: 5.0
     volumes:
       - ./output:/output
     ports:
@@ -246,6 +258,7 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+    stop_grace_period: 10s
     networks:
       - migration_net
 

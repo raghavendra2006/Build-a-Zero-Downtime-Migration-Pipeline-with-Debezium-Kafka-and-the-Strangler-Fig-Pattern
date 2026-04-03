@@ -3,8 +3,6 @@
 # Waits for Kafka Connect REST API to be ready, then registers the
 # Debezium PostgreSQL source connector for the legacy_db.
 
-set -e
-
 CONNECT_URL="http://localhost:8083"
 CONNECTOR_NAME="legacy-orders-connector"
 
@@ -20,12 +18,14 @@ while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
     break
   fi
   ATTEMPT=$((ATTEMPT + 1))
-  echo "    Attempt $ATTEMPT/$MAX_ATTEMPTS — waiting 3s..."
+  if [ $((ATTEMPT % 10)) -eq 0 ]; then
+    echo "    Attempt $ATTEMPT/$MAX_ATTEMPTS — still waiting..."
+  fi
   sleep 3
 done
 
 if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
-  echo "==> ERROR: Kafka Connect REST API did not become available."
+  echo "==> ERROR: Kafka Connect REST API did not become available after $MAX_ATTEMPTS attempts."
   exit 1
 fi
 
@@ -38,7 +38,7 @@ fi
 
 echo "==> Registering connector: $CONNECTOR_NAME"
 
-curl -s -X POST "$CONNECT_URL/connectors" \
+RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$CONNECT_URL/connectors" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "'"$CONNECTOR_NAME"'",
@@ -56,7 +56,15 @@ curl -s -X POST "$CONNECT_URL/connectors" \
       "slot.name": "debezium_orders",
       "publication.name": "dbz_publication"
     }
-  }'
+  }')
 
-echo ""
-echo "==> Connector '$CONNECTOR_NAME' registered successfully."
+HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+BODY=$(echo "$RESPONSE" | head -n -1)
+
+if [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "200" ]; then
+  echo "==> Connector '$CONNECTOR_NAME' registered successfully (HTTP $HTTP_STATUS)."
+else
+  echo "==> WARNING: Connector registration returned HTTP $HTTP_STATUS"
+  echo "    Response: $BODY"
+  exit 1
+fi
