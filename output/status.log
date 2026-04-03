@@ -1,0 +1,10 @@
+﻿cdc_consumer | Up 23 seconds (healthy)
+gateway | Up About a minute (healthy)
+debezium | Up About a minute (healthy)
+micro_service | Up About a minute (healthy)
+legacy_service | Up About a minute (healthy)
+micro_db | Up About a minute (healthy)
+legacy_db | Up About a minute (healthy)
+kafka | Up About a minute (healthy)
+cse_container | Exited (143) 45 minutes ago
+mysql_container | Exited (137) 8 days ago
