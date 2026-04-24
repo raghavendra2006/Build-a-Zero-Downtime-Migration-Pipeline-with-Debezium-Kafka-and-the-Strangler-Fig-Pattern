@@ -18,6 +18,8 @@ from contextlib import asynccontextmanager
 
 import aiofiles
 import asyncpg
+import orjson
+from cachetools import LRUCache
 from aiokafka import AIOKafkaConsumer
 from fastapi import FastAPI, HTTPException
 
@@ -54,6 +56,7 @@ class CDCState:
         self.snapshot_row_count: int = 0
         self.streaming_row_count: int = 0
         self.total_cdc_events: int = 0
+        self.processed_events = LRUCache(maxsize=10000)
 
 
 cdc_state = CDCState()
@@ -73,8 +76,8 @@ def parse_and_classify(raw_value: bytes) -> tuple[dict | None, str]:
         - snapshot_status is "snapshot", "last", "streaming", or "unknown"
     """
     try:
-        envelope = json.loads(raw_value.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        envelope = orjson.loads(raw_value)
+    except orjson.JSONDecodeError:
         logger.warning("Unable to decode Kafka message")
         return None, "unknown"
 
@@ -176,8 +179,17 @@ async def consume_cdc_events():
                 if event is None:
                     continue
 
+                # Idempotency check: track combination of op, ts_ms, and order_id
+                record = event.get("after") or event.get("before")
+                if record and isinstance(record, dict):
+                    event_id = f'{event.get("op")}_{event.get("ts_ms")}_{record.get("order_id")}'
+                    async with cdc_state.lock:
+                        if event_id in cdc_state.processed_events:
+                            continue
+                        cdc_state.processed_events[event_id] = True
+
                 # Async write to JSONL
-                await outfile.write(json.dumps(event, default=str) + "\n")
+                await outfile.write(orjson.dumps(event).decode("utf-8") + "\n")
                 await outfile.flush()
 
                 # Update state under lock

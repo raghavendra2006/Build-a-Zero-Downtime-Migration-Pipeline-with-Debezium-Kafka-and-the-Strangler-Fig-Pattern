@@ -20,7 +20,7 @@ from decimal import Decimal, InvalidOperation
 
 import asyncpg
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
 
 logging.basicConfig(
@@ -84,6 +84,7 @@ app = FastAPI(
     description="Order creation endpoint for the legacy PostgreSQL database",
     version="1.0.0",
     lifespan=lifespan,
+    default_response_class=ORJSONResponse,
 )
 
 
@@ -125,7 +126,7 @@ async def create_order(order: OrderRequest):
                 amount_decimal,
                 order.status,
             )
-        return JSONResponse(
+        return ORJSONResponse(
             status_code=201,
             content={"order_id": order_id, "status": "created"},
         )

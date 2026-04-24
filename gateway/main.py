@@ -17,9 +17,12 @@ import json
 import asyncio
 import time
 import logging
-from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+
+import aiofiles
+import orjson
+from hdrh.histogram import HdrHistogram
 
 import httpx
 from fastapi import FastAPI
@@ -58,8 +61,12 @@ class GatewayState:
         self.micro_error_count: int = 0
         self.consistent_writes: int = 0
         self.inconsistent_writes: int = 0
-        self.legacy_latencies: deque = deque(maxlen=LATENCY_WINDOW_SIZE)
-        self.micro_latencies: deque = deque(maxlen=LATENCY_WINDOW_SIZE)
+        # HdrHistogram: tracks values from 1 to 30000 (ms) with 2 significant digits
+        self.legacy_latencies = HdrHistogram(1, 30000, 2)
+        self.micro_latencies = HdrHistogram(1, 30000, 2)
+        
+        self.metrics_file_lock = asyncio.Lock()
+        self.rollback_file_lock = asyncio.Lock()
 
 
 state = GatewayState()
@@ -71,14 +78,11 @@ http_client: httpx.AsyncClient | None = None
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def calculate_p99(latencies: deque) -> float:
-    """Calculate p99 from a deque of latency values (ms)."""
-    if not latencies:
+def calculate_p99(histogram: HdrHistogram) -> float:
+    """Calculate p99 from a HdrHistogram of latency values (ms)."""
+    if histogram.get_total_count() == 0:
         return 0.0
-    sorted_vals = sorted(latencies)
-    idx = int(len(sorted_vals) * 0.99)
-    idx = min(idx, len(sorted_vals) - 1)
-    return round(sorted_vals[idx], 2)
+    return float(histogram.get_value_at_percentile(99.0))
 
 
 def build_metrics_dict() -> dict:
@@ -102,10 +106,8 @@ def build_metrics_dict() -> dict:
 
 
 def _write_file_sync(path: str, content: str, mode: str = "w") -> None:
-    """Synchronous file write — meant to be called via asyncio.to_thread."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, mode, encoding="utf-8") as f:
-        f.write(content)
+    # Deprecated in favor of aiofiles
+    pass
 
 
 async def post_to_service(url: str, payload: dict) -> tuple[dict | None, float, bool]:
@@ -118,7 +120,11 @@ async def post_to_service(url: str, payload: dict) -> tuple[dict | None, float, 
         resp = await http_client.post(url, json=payload, timeout=HTTP_TIMEOUT_S)
         latency_ms = (time.monotonic() - start) * 1000
         if 200 <= resp.status_code < 300:
-            return resp.json(), latency_ms, True
+            try:
+                data = orjson.loads(resp.content)
+            except orjson.JSONDecodeError:
+                data = None
+            return data, latency_ms, True
         else:
             logger.warning("Service %s returned %d", url, resp.status_code)
             return None, latency_ms, False
@@ -223,8 +229,8 @@ async def create_order(order: OrderRequest):
 
     # Update state atomically
     async with state.lock:
-        state.legacy_latencies.append(legacy_latency)
-        state.micro_latencies.append(micro_latency)
+        state.legacy_latencies.record_value(max(1, min(int(legacy_latency), 30000)))
+        state.micro_latencies.record_value(max(1, min(int(micro_latency), 30000)))
 
         if routed_to == "legacy":
             state.legacy_request_count += 1
@@ -259,10 +265,12 @@ async def get_metrics():
     async with state.lock:
         metrics = build_metrics_dict()
 
-    # Non-blocking file write
+    # Async file write with dedicated lock
     try:
-        content = json.dumps(metrics, indent=2)
-        await asyncio.to_thread(_write_file_sync, METRICS_OUTPUT_FILE, content, "w")
+        content = orjson.dumps(metrics, option=orjson.OPT_INDENT_2).decode("utf-8")
+        async with state.metrics_file_lock:
+            async with aiofiles.open(METRICS_OUTPUT_FILE, "w", encoding="utf-8") as f:
+                await f.write(content)
     except Exception as exc:
         logger.error("Failed to write metrics snapshot: %s", exc)
 
@@ -282,10 +290,12 @@ async def rollback():
         "micro_pct_before": pct_before,
     }
 
-    # Non-blocking file append
+    # Async file append with dedicated lock
     try:
-        line = json.dumps(log_entry) + "\n"
-        await asyncio.to_thread(_write_file_sync, ROLLBACK_LOG_FILE, line, "a")
+        line = orjson.dumps(log_entry).decode("utf-8") + "\n"
+        async with state.rollback_file_lock:
+            async with aiofiles.open(ROLLBACK_LOG_FILE, "a", encoding="utf-8") as f:
+                await f.write(line)
     except Exception as exc:
         logger.error("Failed to write rollback log: %s", exc)
 
